@@ -1,0 +1,494 @@
+---
+title: "Crime data from 2020 EDA"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+### Introduction
+
+This analysis aims to explore crime data from Los Angeles using the dataset provided by Data.gov, covering the period starting from 2020. The dataset can be accessed [here](https://catalog.data.gov/dataset/crime-data-from-2020-to-present).
+
+Notes from dataset description: <br> - This data is transcribed from original crime reports that are typed on paper and therefore there may be some inaccuracies within the data. <br> - Some location fields with missing data are noted as (0°, 0°). <br> - Address fields are only provided to the nearest hundred block in order to maintain privacy. <br>
+
+### Loading Dataset
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(leaflet)
+library(sp)
+library(KernSmooth)
+library(raster)
+library(e1071)
+library(data.table)
+library(ggcorrplot)
+library(plotly)
+
+Sys.setlocale("LC_TIME", "English")
+data_main <- read_csv('C:/Users/Przemysław/Desktop/msad/Crime_Data_from_2020_to_Present.csv',show_col_types = FALSE)
+```
+
+### Initial dataset description
+
+```{r}
+head(data_main)
+```
+
+`{r}{r echo=T, results='hide'} str(data_main)`
+
+`{r}{r echo=T, results='hide'} summary(data_main)`
+
+### Missing values investigation
+
+```{r}
+apply(data_main, 2, function(x) any(is.na(x)))
+```
+
+There are 10 columns containing N/A values. Moreover, based on the dataset description, the Location columns are converted to (0°, 0°) for entries with missing values. However, there are no zeroed LAT or LNG values in the actual dataset.
+
+```{r}
+sum(data_main$LAT == 0 | data_main$LNG == 0)
+```
+
+The percentage impact of the missing values.
+```{r}
+missing_percentage <- colMeans(is.na(data_main)) * 100
+missing_df <- data.frame(Column = names(missing_percentage), Percent_Missing = missing_percentage)
+
+ggplot(missing_df, aes(x = Column, y = Percent_Missing)) +
+  geom_bar(stat = "identity", fill = "skyblue", width = 0.5) +
+  labs(title = "Percentage of Missing Data per Column", x = "Column", y = "Percent Missing") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Based on the missing values percentage, we can drop <i> Crm Cd 3 </i> and <i> Crm Cd 4 </i> as those columns do not contain other values than null.
+
+Values for <i> Mocodes </i>, <i> Vict Descent </i> and <i> Vict Sex </i> could be MNAR (Missing Not At Random) values that are logically associated with each other. 
+The same for <i> Weapon Desc </i> and <i> Weapon Used Cd </i>. 
+```{r}
+missing_rows_mocodes <- which(is.na(data_main$Mocodes))
+missing_rows_descent <- which(is.na(data_main$'Vict Descent'))
+missing_rows_sex <- which(is.na(data_main$'Vict Sex'))
+
+#Check if missing values for Vict Sex, Vict Descent and Mocodes are for the same rows. 
+(identical(missing_rows_mocodes, missing_rows_descent) 
+&& identical(missing_rows_mocodes, missing_rows_sex)
+  && identical(missing_rows_descent, missing_rows_sex))
+```
+There is no exact matching on <i> Mocodes </i>, <i> Vict Descent </i> and <i> Vict Sex </i>. However <i> Vict Descent
+</i> and <i> Vict Sex </i> are matching in 99.99% of cases.
+```{r}
+length(intersect(missing_rows_descent, missing_rows_sex)) / length(missing_rows_descent) * 100
+```
+<i> Mocodes </i> and <i> Vict Sex </i> are matching in 94.85%.
+```{r}
+length(intersect(missing_rows_mocodes, missing_rows_sex)) / length(missing_rows_mocodes) * 100
+```
+We can observe that <i>Vict Sex</i> contains hidden missing values represented as 0.
+```{r}
+head(data_main$'Vict Age'[is.na(data_main$'Vict Descent')], 100)
+```
+The occurrence of missing values in <i>Vict Sex</i> and zero values in <i>Vict Age</i> match 99.97% of the time.
+```{r}
+ length(intersect(missing_rows_sex, which(data_main$'Vict Age' == 0))) / length(missing_rows_sex) * 100
+```
+
+<i> Weapon Desc </i> and <i> Weapon Used Cd </i> have exactly matching missing values. 
+```{r}
+missing_rows_weapon <- which(is.na(data_main$'Weapon Used Cd'))
+missing_rows_weapon_desc <- which(is.na(data_main$'Weapon Desc'))
+
+identical(missing_rows_weapon, missing_rows_weapon_desc)
+```
+<b> Summary </b> <br> 
+- Columns <i>Crm Cd 2</i>, <i>Crm Cd 3</i>, <i>Crm Cd 4</i>, and <i>Cross Street</i> contain more than 80% missing values and do not provide valuable information for analysis. These columns can be dropped in the next steps. <br>
+- Columns <i>Weapon Desc</i> and <i>Weapon Used Cd</i> have matching occurrences of missing values and are MNAR (Missing Not At Random). This suggests that these columns have values only if the crime involved the use of a weapon.<br>
+- Columns <i>Mocodes</i>, <i>Vict Descent</i>, <i>Vict Sex</i>, and <i>Vict Age</i> (with 0 as a missing value) have most occurrences matching, but not exactly. These variables are logically associated with each other; data is missing if there is an inability to identify a victim. So, those values are mostly MNAR but there is posibility of MAR (Missing at random).<br>
+
+### Basic dataset processing
+```{r}
+# Removing unnecessary columns  
+data_main <- data_main[, !names(data_main) %in% c("DR_NO", 
+                                                  "Part 1-2",
+                                                  "AREA", #the same info as AREA NAME
+                                                  "Crm Cd", 
+                                                  "Premis Cd",
+                                                  "Status", #the same info as Status Desc
+                                                  "Mocodes",
+                                                  "Crm Cd 1", 
+                                                  "Crm Cd 2", 
+                                                  "Crm Cd 2",
+                                                  "Crm Cd 3", 
+                                                  "Crm Cd 4", 
+                                                  "Cross Street")]
+
+```
+
+Merging together <i> DATE OCC </i> (format MM/DD/YYYY) and <i> TIME OCC </i> (format HHMM), 
+```{r}
+hour <- as.numeric(substr(data_main$'TIME OCC', 1, 2))
+minute <- as.numeric(substr(data_main$'TIME OCC', 3, 4))
+date <- as.Date(substr(data_main$'DATE OCC', 1, 10) , format = "%m/%d/%Y")
+                   
+data_main$datetime_occ <- as.POSIXct(paste(date, hour, minute, sep = " "), format = "%Y-%m-%d %H %M")
+data_main = data_main[, !names(data_main) %in% c("DATE OCC", "TIME OCC")]
+```
+
+Mapping <i> Vict Descent </i> and <i> Vict Sex </i>. Mapping from LAPD OpenData City of LA. 
+```{r}
+victim_descent_mapping = c("A" = "Other Asian",
+                           "B" = "Black",
+                           "C" = "Chinese",
+                           "D" = "Cambodian",
+                           "F" = "Filipino",
+                           "G" = "Guamanian",
+                           "H" = "Hispanic/Latin/Mexican",
+                           "I" = "Native",
+                           "J" = "Japanese",
+                           "K" = "Korean",
+                           "L" = "Laotian",
+                           "O" = "Other",
+                           "P" = "Pacific Islander",
+                           "S" = "Samoan",
+                           "U" = "Hawaiian",
+                           "V" = "Vietnamese",
+                           "W" = "White",
+                           "X" = "Unknown",
+                           "Z" = "Asian Indian")
+
+data_main$'Vict Descent' <- factor(data_main$'Vict Descent', levels = names(victim_descent_mapping), labels = victim_descent_mapping)
+
+victim_sex_mapping = c("F" = "Female",
+                           "M" = "Male",
+                           "H" = "Other",
+                           "X" = "Unknown")
+
+data_main$'Vict Sex' <- factor(data_main$'Vict Sex', levels = names(victim_sex_mapping), labels = victim_sex_mapping)
+```
+
+Changing 0 in <i> Vict Age </i> into N/A and converting to date in <i> Date Rptd. </i>
+```{r}
+data_main$'Vict Age'[data_main$'Vict Age' <= 0] <- NA
+data_main$'Date Rptd' <- as.Date(data_main$'Date Rptd', format = "%m/%d/%Y")
+```
+
+New columns <i> dow_occ </i> day of week of the crime, <i> hod_occ </i> hour of day, week and year of the crime.
+```{r}
+data_main$dow_occ <- weekdays(data_main$datetime_occ)
+data_main$hod_occ <- hour(data_main$datetime_occ)
+
+data_main$week <- lubridate::week(data_main$datetime_occ)
+data_main$year <- lubridate::year(data_main$datetime_occ)
+```
+
+Days between <i> Date Rptd </i> and <i> datetime_occ </i> 
+```{r}
+data_main$days_diffrence <- as.numeric(data_main$'Date Rptd' - as.Date(data_main$datetime_occ))
+```
+
+### Basic visual analysis
+Visualising volume of crimes by LA area. 
+```{r}
+barplot(sort(table(data_main$'AREA NAME'), TRUE), 
+        main = "Volume of crimes by LA area ",
+        ylab = "Count",
+        col = "skyblue",        
+        border = "black",       
+        las = 2,                
+        cex.names = 0.8,        
+        cex.lab = 1,          
+        cex.main = 1.4,         
+        beside = TRUE           
+)
+```
+<br> Top 25 crime types and locations in LA.
+```{r}
+for (val in list(list("crime type", "Crm Cd Desc"), list('location', "Premis Desc"))){
+  par(mar = c(5, 15, 1, 1))
+  options(repr.plot.height=100) 
+  
+  barplot(tail(sort(table(data_main[[val[[2]]]])),25), 
+          main = paste("Volume of crimes by", val[[1]], "top 25"),
+          horiz = TRUE,
+          xlab = "Count",
+          col = "skyblue",        
+          border = "black",       
+          las = 2,                
+          cex.names = 0.4,        
+          cex.lab = 0.5,          
+          cex.main = 1,         
+          beside = TRUE,
+  )
+}
+```
+
+<br>Volume of crimes by victim descent.
+```{r}
+par(mar = c(5, 10, 1, 1))
+barplot(sort(table(subset(data_main, 'Vict Descent' > 0)$'Vict Descent')), 
+        main = "Volume of crimes by victim descent",
+        horiz = TRUE,
+        xlab = "Count",
+        col = "skyblue",        
+        border = "black",       
+        las = 2,                
+        cex.names = 0.9,        
+        cex.lab = 0.5,          
+        cex.main = 1,         
+        beside = TRUE,
+)
+```
+
+<br>Volume of crimes by victim descent and victim sex.
+```{r}
+df_vict <- na.omit(data_main[, c("Vict Descent", "Vict Sex", "Vict Age")])
+df_vict$"Vict Descent" <- as.character(df_vict$"Vict Descent")
+names(df_vict) <- c("vict_descent", "vict_sex", "vict_age")
+df_vict <- df_vict %>%filter(vict_sex != "Unknown")
+
+
+ggplot(df_vict, aes(x =  factor(vict_descent, levels = names(sort(table(vict_descent), decreasing = TRUE))), fill = vict_sex)) +
+  geom_bar(position = "dodge", color = "black", alpha = 0.8) +
+  labs(title = "Volume of crimes with victim descent breakdown by sex", x = "Victim descent", y = "Count") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.title = element_blank(),
+    legend.position = "top"
+) 
+```
+
+
+```{r}
+ggplot(df_vict, aes(x = vict_age, group = vict_sex, color = vict_sex)) +
+  geom_line(stat = "count") +
+  labs(title = "Count of victims by age and sex", x = "Age", y = "Count") +
+  theme_minimal()
+```
+
+
+```{r}
+ggplot(df_vict, aes(x = vict_sex, y = vict_age, fill = vict_sex)) +
+  geom_boxplot() +
+  labs(title = "Victim age by sex", x = "Sex", y = "Age") +
+  theme_minimal()
+```
+<br>Crimes volume in time - hour of day and day of weeks.
+```{r}
+dow_hod_df <- data_main %>%
+  group_by(dow_occ, hod_occ) %>%
+  summarise(Count = n())%>%
+  filter(!is.na(dow_occ))
+
+dow_hod_df$dow_occ <- factor(dow_hod_df$dow_occ, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"), ordered = TRUE)
+
+ggplot(dow_hod_df, aes(x = dow_occ, y = hod_occ, fill = Count)) +
+  geom_tile() +
+  scale_fill_gradient(low = "yellow", high = "red") + 
+  labs(title = "Heatmap of crimes frequency by hour of day and day of week", x = "day of week", y = "hour of day", fill = "frequency") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) 
+```
+<br>Analysis of number of days between date reported and day of crime occurrence.
+```{r}
+density_days_diffrence <- density(na.omit(as.numeric(data_main$days_diffrence)))
+ggplot(data.frame(x = density_days_diffrence$x, y = density_days_diffrence$y), aes(x = x, y = y)) +
+  geom_line() +
+  labs(title = "Density Plot of number of days between date reported and day of crime occurrence", x = "days between", y = "Density")
+```
+<br>Crime time series visualization with trend.
+```{r}
+weekly_counts <- data_main %>%
+  group_by(year, week) %>%
+  summarise(count = n())%>%
+  filter(!(year==2024&week>4))
+
+ggplot(weekly_counts, aes(x = as.Date(paste(year, week, "1", sep = "-"), format = "%Y-%U-%u"), y = count)) +
+  geom_line() +
+  geom_smooth(method = "lm", se = FALSE, color = "red", size = 0.3) +
+  labs(title = "Weekly crimes count with trend", x = "Date", y = "Number of Records") +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b %Y") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5)) 
+```
+<br>Weapon analysis - top 20 weapons. 
+```{r}
+#showing action taken 
+par(mar = c(5, 20, 1, 1))
+barplot(tail(sort(table(na.omit(data_main$'Weapon Desc')), FALSE),20), 
+        main = "Crimes with weapon by type",
+        xlab = "Count",
+        horiz = TRUE,
+        col = "skyblue",        
+        border = "black",       
+        las = 1,                
+        cex.names = 0.6,        
+        cex.lab = 1,          
+        cex.main = 1.4,         
+        beside = TRUE           
+)
+
+```
+<br>Volume of crimes by crime status 
+```{r}
+par(mar = c(5, 6, 1, 1))
+barplot(sort(table(data_main$'Status Desc')), 
+        main = "Volume of crimes by action taken",
+        horiz = TRUE,
+        xlab = "Count",
+        col = "skyblue",        
+        border = "black",       
+        las = 2,                
+        cex.names = 1,        
+        cex.lab = 0.5,          
+        cex.main = 1,         
+        beside = TRUE,
+)
+```
+
+### Descriptive analysis
+Summary for continuous variables.
+```{r}
+descriptive_cont <- data_main[, names(data_main) %in% c("Vict Age", "days_diffrence")]
+summary(descriptive_cont)
+```
+Dispersion measurements for continuous variables.
+```{r}
+descriptive_cont <- na.omit(descriptive_cont)
+summarise(descriptive_cont,
+          variance_vict_age = var(`Vict Age`),
+          sd_vict_age = sd(`Vict Age`),
+          cv_vict_age = sd(`Vict Age`) / mean(`Vict Age`) * 100,
+          range_vict_age = diff(range(`Vict Age`)),
+          iqr_vict_age = IQR(`Vict Age`),
+          
+          variance_days_diffrence = var(`days_diffrence`),
+          sd_days_diffrence = sd(`days_diffrence`),
+          cv_days_diffrence = sd(`days_diffrence`) / mean(`days_diffrence`) * 100,
+          range_days_diffrence = diff(range(`days_diffrence`)),
+          iqr_days_diffrence = IQR(`days_diffrence`)
+)
+```
+Concentration measurements for continuous variables.
+```{r}
+summarise(descriptive_cont,
+          skewness_vict_age = skewness(`Vict Age`),
+          kurtosis_vict_age = kurtosis(`Vict Age`),
+          skewness_days_diffrence = skewness(`days_diffrence`),
+          kurtosis_days_diffrence = kurtosis(`days_diffrence`)
+)
+```
+Percentage analysis for selected categorical variables. 
+```{r}
+calculate_percentage_stats <- function(var) {
+  if (length(unique(data_main[[var]])) > 20) {
+    data_subset <- subset(data_main, data_main[[var]] %in% 
+                            names(sort(table(data_main[[var]]), decreasing = TRUE))[1:20])
+    return(sort(table(data_subset[[var]]) / nrow(data_main) * 100, TRUE))
+  } 
+  else {
+    return(sort(table(data_main[[var]]) / nrow(data_main) * 100, TRUE))
+  }
+}
+
+
+for (var in c("AREA NAME", "Crm Cd Desc", "Vict Sex", "Vict Descent", "Status Desc", "Weapon Desc", "dow_occ", "Premis Desc")) {
+  cat(paste("Percentage statistics for", var, ":\n"))
+  print(calculate_percentage_stats(var))
+  cat("\n")
+}
+```
+
+
+<b> TL;DR for visual and descriptive analysis </b> <br> 
+- The most frequent LA crimes occur in the <i>central</i> and <i>77th street</i> areas, comprising 6.8% and 6.3% of the total, respectively. <br> 
+- Most crimes occur on the street, accounting for over 25% of all reported incidents.<br> 
+- The most prevalent type of crime is vehicle theft, representing 10.8% of all reported crimes.<br> 
+- Victims are predominantly of Hispanic, Latin, or Mexican descent, constituting over 40% of the total. The distribution of sexes is nearly uniform, with the mean age around 40 years old.<br> 
+- Crimes predominantly occur during nighttime, with a peak on Friday nights, although overall distribution across days of the week is similar.<br> 
+- There is a visible increasing trend in crime volume since 2020.<br> 
+- The majority of crimes are reported promptly after they occur.<br> 
+
+
+### Relational analysis
+Correlogram for a few variables. 
+```{r}
+data_main <- data_main %>% 
+  mutate(is_investigation_cont = ifelse(data_main$"Status Desc" == "Invest Cont", 1, 0),
+         is_street = ifelse(data_main$"Premis Desc" == "STREET", 1, 0), 
+         is_vehicle_stolen = ifelse(data_main$"Crm Cd Desc" == "VEHICLE - STOLEN", 1, 0),
+         is_central = ifelse(data_main$"AREA NAME" == "Central", 1, 0),
+         is_77_street = ifelse(data_main$"AREA NAME" == "77th Street", 1, 0), 
+         is_male = ifelse(data_main$"Vict Sex" == "Male", 1, 0), 
+         is_weapon = ifelse(is.na(data_main$"Weapon Desc"), 0, 1), 
+         is_theft_of_identity = ifelse(data_main$"Crm Cd Desc" == "THEFT OF IDENTITY", 1, 0))
+
+corr_data <- data_main[, names(data_main) %in% c("Vict Age", "days_diffrence", "is_investigation_cont", 
+                                                "is_street", "is_vehicle_stolen", "is_weapon",
+                                                "is_central", "is_77_street", "is_male", "is_theft_of_identity")]
+
+corr_data <- na.omit(corr_data[sample(nrow(corr_data), 10000), ])
+correlation_matrix <- cor(corr_data, use = "complete.obs")
+correlation_matrix[is.na(correlation_matrix)] = 0
+
+ggplotly(ggcorrplot(
+  correlation_matrix, hc.order = TRUE, type = "lower",
+  outline.col = "white"
+))
+```
+
+
+### Geospatial analysis
+Showing example 100 crimes with description 
+```{r}
+m <- leaflet() %>%
+  setView(lng = -118.2437, lat = 34.0522, zoom = 10) %>%
+  addTiles()
+for (i in 1:nrow(tail(data_main, 100))) {
+  m <- addMarkers(m, lng = data_main$LON[i], lat = data_main$LAT[i], popup = data_main$'Crm Cd Desc'[i])
+}
+m
+```
+
+Showing heatmap of crimes locations. 
+```{r}
+data_main <- subset(data_main, (data_main$LON != 0) & (data_main$LAT != 0))
+kde <- bkde2D(cbind(data_main$LON, data_main$LAT),
+              bandwidth=c(.0045, .0068), gridsize = c(1e3,1e3))
+KernelDensityRaster <- raster(list(x=kde$x1 ,y=kde$x2 ,z = kde$fhat))
+KernelDensityRaster@data@values[which(KernelDensityRaster@data@values < 1)] <- NA
+ 
+palRaster <- colorNumeric("YlOrRd", domain = KernelDensityRaster@data@values, na.color = "transparent")
+
+leaflet() %>%
+  setView(lng = -118.2437, lat = 34.0522, zoom = 10) %>% 
+  addTiles() %>% 
+  addRasterImage(KernelDensityRaster, 
+                 colors = palRaster, 
+                 opacity = .8) %>%
+  addLegend(pal = palRaster, 
+            values = KernelDensityRaster@data@values, 
+            title = "Density of Crimes")
+```
+
+Showing example 1000 crimes with weapon 
+```{r}
+
+df_weapon <- na.omit(data_main[, c("Weapon Desc", "LAT", "LON")])
+m <- leaflet() %>%
+  setView(lng = -118.2437, lat = 34.0522, zoom = 10) %>%
+  addTiles()
+for (i in 1:nrow(df_weapon %>% sample_n(1000))) {
+  m <- addMarkers(m, lng = df_weapon$LON[i], lat = df_weapon$LAT[i], popup = df_weapon$'Weapon Desc'[i])
+}
+m
+```
+
